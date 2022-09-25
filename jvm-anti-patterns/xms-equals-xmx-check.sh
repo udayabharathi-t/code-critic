@@ -1,5 +1,34 @@
 #!/bin/bash
 
+function split_by_newline {
+    local str IFS
+    str=$1
+    IFS=$'\n'
+    split_str=($str)
+    echo $split_str
+}
+
+# parse_yaml is a function to parse yaml files. 
+# Note: this is not a full fledged implementation. This won't work for array cases.
+# Expects YAML file's indentation to be 2 spaces all the time.
+# Usage: parse_yaml "/path/to/file.yaml" <optional prefix for exported configs>
+function parse_yaml {
+   local prefix=$2
+   local s='[[:space:]]*' w='[a-zA-Z0-9_]*' fs=$(echo @|tr @ '\034')
+   sed -ne "s|^\($s\):|\1|" \
+        -e "s|^\($s\)\($w\)$s:$s[\"']\(.*\)[\"']$s\$|\1$fs\2$fs\3|p" \
+        -e "s|^\($s\)\($w\)$s:$s\(.*\)$s\$|\1$fs\2$fs\3|p"  $1 |
+   awk -F$fs '{
+      indent = length($1)/2;
+      vname[indent] = $2;
+      for (i in vname) {if (i > indent) {delete vname[i]}}
+      if (length($3) > 0) {
+         vn=""; for (i=0; i<indent; i++) {vn=(vn)(vname[i])("_")}
+         printf("%s%s%s=\"%s\"\n", "'$prefix'",vn, $2, $3);
+      }
+   }'
+}
+
 # find_index_of_substring is a function to find a substring in a string and return index.
 # Usage: find_index_of_substring "<actual string>" "<string to find>" "<start index>"
 # echoes first occurrence if substring exists else echoes -1.
@@ -30,6 +59,27 @@ function find_index_of_substring {
        echo "$pos"
        return 0
     fi
+}
+
+# convert_app_yaml_memory_to_bytes is a function to convert app.yaml's infra_compute_memory to bytes.
+# Supports following suffixes: Gi, gi, Mi, mi
+# Usage: convert_app_yaml_memory_to_bytes "<Value of app.yaml's infra_compute_memory>"
+# echoes value in bytes.
+function convert_app_yaml_memory_to_bytes {
+    local val suffix num
+    val=$1
+
+    # Extract the prefix number
+    num=${val:0:${#val}-2}
+
+    # Extract the suffix character
+    suffix=${val:${#val}-2:${#val}}
+
+   if [ "$suffix" == "Gi" ] || [ "$suffix" == "gi" ]; then
+       echo $(($num*1000*1000*1000))
+   elif [ "$suffix" == "Mi" ] || [ "$suffix" == "mi" ]; then
+       echo $(($num*1000*1000))
+   fi
 }
 
 # convert_xm_val_to_bytes is a function to convert -Xm_ value to bytes. Supports following suffixes: 
@@ -77,20 +127,63 @@ function get_xm_as_bytes {
     echo $(convert_xm_val_to_bytes $actual_value)
 }
 
-# Find all matching JAVA args containing both Xms and Xmx
-matching_java_args=$(grep -Hnr --include="*.conf" 'Xms.*Xmx\|Xmx.*Xms' .)
+function exec_antipattern_check {
+    local matching_java_args all_matches path_to_check actual_memory_allocated
+    path_to_check=$1
+    actual_memory_allocated=$2
 
-# Convert matching_java_args to array of strings
-IFS=$'\n' read -r -a all_matches <<< "$matching_java_args"
+    echo "Inside dir $path_to_check with memory allocation $actual_memory_allocated"
 
-# If there are 0 match on a Java repo then that means we don't have the configuration, return error
-if (( ${#all_matches} == 0 )); then
-    echo "{\"output\": \"No Java Args with Xmx and Xms configuration found!\"}"
-    exit 0
-fi
+    # Find all matching JAVA args containing both Xms and Xmx
+    matching_java_args=$(grep -Hnr --include="*.conf" 'Xms.*Xmx\|Xmx.*Xms' $path_to_check)
 
-for match in "${all_matches[@]}"
+    # Convert matching_java_args to array of strings
+    all_matches=$(split_by_newline "$matching_java_args")
+
+    # If there are 0 match on a Java repo then that means we don't have the configuration, return error
+    if (( ${#all_matches[@]} == 0 )); then
+        echo "{\"output\": \"No Java Args with Xmx and Xms configuration found!\"}"
+        exit 0
+    fi
+
+    for match in "${all_matches[@]}"
+    do
+        echo "Executing anti-pattern check on $match"
+    done
+}
+
+# Find all yaml files available in the repo.
+all_yaml_files=$(find . -name "*.yaml" -or -name "*.yml")
+
+# Convert the same to array.
+all_matching_ymls=$(split_by_newline $all_yaml_files)
+
+# Loop through all matching yaml files and execute anti-pattern.
+for yaml_file in "${all_matching_ymls[@]}"
 do
-    
+    echo "Checking file $yaml_file"
+
+    # Parse yaml file.
+    eval $(parse_yaml $yaml_file)
+
+    # Check if infra compute memory is present in the yaml.
+    if [[ -z $infra_compute_memory ]]; then
+        continue
+    fi
+
+    # Check if conf directory path is specified in the yaml.
+    if [[ -z $envVar_config_ref ]]; then
+        continue
+    fi
+
+    # Compute actual memory specified in service definition as bytes.
+    infra_compute_memory=$(convert_app_yaml_memory_to_bytes $infra_compute_memory)
+
+    # Execute anti pattern checks.
+    exec_antipattern_check $envVar_config_ref $infra_compute_memory
+
+    # Reset for next iteration
+    infra_compute_memory=""
+    envVar_config_ref=""
 done
 
