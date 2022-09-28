@@ -1,13 +1,5 @@
 #!/bin/bash
 
-function split_by_newline {
-    local str IFS
-    str=$1
-    IFS=$'\n'
-    split_str=($str)
-    echo $split_str
-}
-
 # parse_yaml is a function to parse yaml files. 
 # Note: this is not a full fledged implementation. This won't work for array cases.
 # Expects YAML file's indentation to be 2 spaces all the time.
@@ -120,6 +112,16 @@ function get_xm_as_bytes {
 
     index_of_space_after_config=$(find_index_of_substring "$java_args" " " $index_of_config)
 
+    # If the configuration is specified dead last.
+    if [[ $index_of_space_after_config -eq -1 ]]; then
+        re_for_number='^[0-9]+$'
+        for (( i=$index_of_config+$config_len-1; i<${#java_args}; i++ )); do
+            if ! [[ "${java_args:$i:1}" =~ $re_for_number ]] ; then
+                index_of_space_after_config=i
+            fi
+        done
+    fi
+
     start_index=$index_of_config+$config_len-1
     end_index=$index_of_space_after_config-$index_of_config-$config_len
     actual_value="${java_args:$start_index:$end_index}"
@@ -127,63 +129,114 @@ function get_xm_as_bytes {
     echo $(convert_xm_val_to_bytes $actual_value)
 }
 
-function exec_antipattern_check {
+# get_file_path_from_grep_match is a function used to fetch the file path from a grep match output
+# Usage: get_file_path_from_grep_match <grep match>
+function get_file_path_from_grep_match {
+    local match index_of_first_colon
+    match=$1
+
+    index_of_first_colon=$(find_index_of_substring "$match" ":" 1)
+    echo "${match:0:$index_of_first_colon-1}"
+}
+
+# line_number_from_grep_match is a function used to fetch the line number from a grep match output.
+# Usage: line_number_from_grep_match <grep match>
+function line_number_from_grep_match {
+    local match index_of_first_colon index_of_second_colon
+    match=$1
+
+    index_of_first_colon=$(find_index_of_substring "$match" ":" 1)
+    index_of_second_colon=$(find_index_of_substring "$match" ":" index_of_first_colon+1)
+    echo "${match:index_of_first_colon:index_of_second_colon-index_of_first_colon-1}"
+}
+
+# exec_antipattern_check_for_conf is a function which actually handles the anti pattern check for a 
+# given matching Java Args output.
+# Usage: exec_antipattern_check_for_conf <JAVA Args> <actual memory allocated>
+function exec_antipattern_check_for_conf {
+    local match xmx_val xms_val actual_memory_allocated file_path line_number
+    match=$1
+    actual_memory_allocated=$2
+    file_path=$(get_file_path_from_grep_match "$match")
+    line_number=$(line_number_from_grep_match "$match")
+
+    xmx_val=$(get_xm_as_bytes x "$match")
+    xms_val=$(get_xm_as_bytes s "$match")
+
+    # echo "DEBUG: File: $file_path, Line number: $line_number, Xmx: $xmx_val bytes, Xms: $xms_val bytes, Actual memory: $actual_memory_allocated bytes"
+
+    # Check if -Xmx configuration is equal to -Xms configuration.
+    if [[ $xmx_val -ne $xms_val ]]; then
+        echo "Xmx value ($xmx_val bytes) is not equal to Xms ($xms_val bytes) value at file: $file_path, line:$line_number"
+    fi
+
+    # Check if at least 1 GB of space is left for system process.
+    if [[ $xmx_val+1000000000 -gt $actual_memory_allocated ]]; then
+        echo "At least 1 GB of memory should be left for the system processes. Xmx is configured too high comparing to actual memory allocated. Xmx: $xmx_val, Actual memory: $actual_memory_allocated at file: $file_path, line:$line_number"
+    fi
+}
+
+# exec_antipattern_check_for_file is a function which executes anti pattern check on every match 
+# found in a given conf directory path
+# Usage: exec_antipattern_check_for_conf_path <Path to conf> <actual memory allocated>
+function exec_antipattern_check_for_conf_path {
     local matching_java_args all_matches path_to_check actual_memory_allocated
     path_to_check=$1
     actual_memory_allocated=$2
 
-    echo "Inside dir $path_to_check with memory allocation $actual_memory_allocated"
-
     # Find all matching JAVA args containing both Xms and Xmx
     matching_java_args=$(grep -Hnr --include="*.conf" 'Xms.*Xmx\|Xmx.*Xms' $path_to_check)
 
-    # Convert matching_java_args to array of strings
-    all_matches=$(split_by_newline "$matching_java_args")
-
     # If there are 0 match on a Java repo then that means we don't have the configuration, return error
-    if (( ${#all_matches[@]} == 0 )); then
-        echo "{\"output\": \"No Java Args with Xmx and Xms configuration found!\"}"
-        exit 0
+    if [[ -z $matching_java_args ]]; then
+        echo "{\"output\": \"No Java Args with Xmx and Xms configuration found on conf directory at path: $path_to_check!\"}"
     fi
 
-    for match in "${all_matches[@]}"
-    do
-        echo "Executing anti-pattern check on $match"
-    done
+    # Execute antipattern check for each match.
+    echo "$matching_java_args" | while read match ; do exec_antipattern_check_for_conf "$match" $actual_memory_allocated ; done
+
 }
 
-# Find all yaml files available in the repo.
-all_yaml_files=$(find . -name "*.yaml" -or -name "*.yml")
-
-# Convert the same to array.
-all_matching_ymls=$(split_by_newline $all_yaml_files)
-
-# Loop through all matching yaml files and execute anti-pattern.
-for yaml_file in "${all_matching_ymls[@]}"
-do
-    echo "Checking file $yaml_file"
+# process_yaml is a function which processes a given service definition app yaml file and 
+# executes anti pattern check on the configured conf directory with the mentioned infra 
+# compute memory.
+# Note: if given yaml file doesn't have infra.compute.memory or envVar.config.ref configuration,
+# this function will simply skip processing for that file.
+# Usage: process_yaml <path to app.yaml>
+function process_yaml {
+    local yaml_file infra_compute_memory envVar_config_ref
+    yaml_file=$1
 
     # Parse yaml file.
     eval $(parse_yaml $yaml_file)
 
     # Check if infra compute memory is present in the yaml.
     if [[ -z $infra_compute_memory ]]; then
-        continue
+        return
     fi
 
     # Check if conf directory path is specified in the yaml.
     if [[ -z $envVar_config_ref ]]; then
-        continue
+        return
     fi
+
+    # echo "==========Processing $yaml_file==========="
 
     # Compute actual memory specified in service definition as bytes.
     infra_compute_memory=$(convert_app_yaml_memory_to_bytes $infra_compute_memory)
 
     # Execute anti pattern checks.
-    exec_antipattern_check $envVar_config_ref $infra_compute_memory
+    exec_antipattern_check_for_conf_path $envVar_config_ref $infra_compute_memory
+
+    # echo "==========Processed $yaml_file==========="
 
     # Reset for next iteration
     infra_compute_memory=""
     envVar_config_ref=""
+}
+
+# Find all yaml files available in the repo and process for each file.
+for yaml in $(find . -name "*.yaml" -or -name "*.yml"); do
+    process_yaml $yaml
 done
 
