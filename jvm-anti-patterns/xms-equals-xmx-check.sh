@@ -190,6 +190,7 @@ function exec_antipattern_check_for_conf_path {
     # If there are 0 match on a Java repo then that means we don't have the configuration, return error
     if [[ -z $matching_java_args ]]; then
         echo "{\"output\": \"No Java Args with Xmx and Xms configuration found on conf directory at path: $path_to_check!\"}"
+        return
     fi
 
     # Execute antipattern check for each match.
